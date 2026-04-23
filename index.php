@@ -752,6 +752,13 @@ $sellerDashboardStats = [
     'refund_pending' => 0,
     'refund_processed' => 0,
     'open_offers' => 0,
+    'total_seller_orders' => 0,
+    'this_month_orders' => 0,
+    'paid_to_process' => 0,
+    'awaiting_shipment' => 0,
+    'shipped' => 0,
+    'completed' => 0,
+    'cancelled_refunded' => 0,	
    'refunds_pending_approval' => 0,
     'paid_waiting_pack' => 0,
     'offers_waiting_action' => 0,	
@@ -1187,6 +1194,91 @@ if ($isSellerApproved && $userId > 0) {
     $orderPage = bv_member_sd_existing_page(['/seller/order_detail.php', '/member/order_detail.php', '/member/order_view.php', '/seller/orders.php']);
     $refundPage = bv_member_sd_existing_page(['/seller/refund_view.php', '/seller/refunds.php']);
     $offerPage = bv_member_sd_existing_page(['/offer.php', '/seller/offers.php']);
+   try {
+        if (bv_member_sd_table_exists($pdo, 'orders') && bv_member_sd_table_exists($pdo, 'order_items')) {
+            $orderCols = bv_member_sd_columns($pdo, 'orders');
+            $orderItemCols = bv_member_sd_columns($pdo, 'order_items');
+            $listingExists = bv_member_sd_table_exists($pdo, 'listings');
+            $listingCols = $listingExists ? bv_member_sd_columns($pdo, 'listings') : [];
+
+            $qtyCandidates = [];
+            if (!empty($orderItemCols['quantity'])) $qtyCandidates[] = 'oi.quantity';
+            if (!empty($orderItemCols['qty'])) $qtyCandidates[] = 'oi.qty';
+            $qtyExpr = bv_member_sd_pick_expr($qtyCandidates, '1');
+
+            $lineTotalCandidates = [];
+            if (!empty($orderItemCols['line_total'])) $lineTotalCandidates[] = 'oi.line_total';
+            if (!empty($orderItemCols['total_price'])) $lineTotalCandidates[] = 'oi.total_price';
+            if (!empty($orderItemCols['subtotal'])) $lineTotalCandidates[] = 'oi.subtotal';
+            $unitCandidates = [];
+            if (!empty($orderItemCols['unit_price'])) $unitCandidates[] = 'oi.unit_price';
+            if (!empty($orderItemCols['price'])) $unitCandidates[] = 'oi.price';
+            if ($unitCandidates) {
+                $lineTotalCandidates[] = '(COALESCE(' . implode(', ', $unitCandidates) . ', 0) * COALESCE(' . $qtyExpr . ', 1))';
+            }
+            $lineTotalExpr = bv_member_sd_pick_expr($lineTotalCandidates, '0');
+
+            $orderStatusExpr = !empty($orderCols['status']) ? 'LOWER(COALESCE(o.status, \'\'))' : "''";
+            $paymentStatusExpr = !empty($orderCols['payment_status']) ? 'LOWER(COALESCE(o.payment_status, \'\'))' : (!empty($orderCols['payment_state']) ? 'LOWER(COALESCE(o.payment_state, \'\'))' : "''");
+            $currencyExpr = !empty($orderCols['currency']) ? 'o.currency' : (!empty($orderItemCols['currency']) ? 'oi.currency' : "'USD'");
+            $createdExpr = !empty($orderCols['created_at']) ? 'o.created_at' : (!empty($orderCols['updated_at']) ? 'o.updated_at' : 'NOW()');
+
+            $ownerWhere = [];
+            if (!empty($orderItemCols['seller_id'])) {
+                $ownerWhere[] = 'oi.seller_id = :seller_id';
+            }
+            if ($listingExists && !empty($orderItemCols['listing_id']) && !empty($listingCols['seller_id'])) {
+                $ownerWhere[] = 'l.seller_id = :seller_id';
+            }
+
+            if ($ownerWhere) {
+                $monthStart = (new DateTimeImmutable('first day of this month 00:00:00'))->format('Y-m-d H:i:s');
+                $nextMonthStart = (new DateTimeImmutable('first day of next month 00:00:00'))->format('Y-m-d H:i:s');
+                $listingJoin = ($listingExists && !empty($orderItemCols['listing_id'])) ? 'LEFT JOIN listings l ON l.id = oi.listing_id' : '';
+
+                $sql = "
+                    SELECT
+                        COUNT(DISTINCT o.id) AS total_seller_orders,
+                        COUNT(DISTINCT CASE WHEN ({$createdExpr} >= :month_start AND {$createdExpr} < :next_month_start) THEN o.id END) AS this_month_orders,
+                        SUM(CASE WHEN {$createdExpr} >= :month_start AND {$createdExpr} < :next_month_start AND {$orderStatusExpr} IN ('paid','confirmed','processing','packing','shipped','completed','refunded') THEN COALESCE({$lineTotalExpr}, 0) ELSE 0 END) AS this_month_sales,
+                        COUNT(DISTINCT CASE WHEN {$orderStatusExpr} IN ('pending','pending_payment','reserved') THEN o.id END) AS new_orders,
+                        COUNT(DISTINCT CASE WHEN {$orderStatusExpr} IN ('paid','confirmed','processing','packing') OR {$paymentStatusExpr} IN ('paid','captured','completed','success') THEN o.id END) AS paid_orders,
+                        COUNT(DISTINCT CASE WHEN {$orderStatusExpr} IN ('paid','confirmed','processing','packing') THEN o.id END) AS paid_to_process,
+                        COUNT(DISTINCT CASE WHEN {$orderStatusExpr} IN ('paid','confirmed','processing','packing') THEN o.id END) AS awaiting_shipment,
+                        COUNT(DISTINCT CASE WHEN {$orderStatusExpr} = 'shipped' THEN o.id END) AS shipped,
+                        COUNT(DISTINCT CASE WHEN {$orderStatusExpr} = 'completed' THEN o.id END) AS completed,
+                        COUNT(DISTINCT CASE WHEN {$orderStatusExpr} IN ('cancelled','refunded') THEN o.id END) AS cancelled_refunded,
+                        MAX(COALESCE({$currencyExpr}, 'USD')) AS currency
+                    FROM orders o
+                    INNER JOIN order_items oi ON oi.order_id = o.id
+                    {$listingJoin}
+                    WHERE (" . implode(' OR ', $ownerWhere) . ")
+                ";
+                $stmt = $pdo->prepare($sql);
+                $stmt->execute([
+                    ':seller_id' => $sellerId,
+                    ':month_start' => $monthStart,
+                    ':next_month_start' => $nextMonthStart,
+                ]);
+                $row = $stmt->fetch(PDO::FETCH_ASSOC) ?: [];
+
+                $sellerDashboardStats['total_seller_orders'] = (int)($row['total_seller_orders'] ?? 0);
+                $sellerDashboardStats['this_month_orders'] = (int)($row['this_month_orders'] ?? 0);
+                $sellerDashboardStats['this_month_sales'] = (float)($row['this_month_sales'] ?? 0);
+                $sellerDashboardStats['new_orders'] = (int)($row['new_orders'] ?? 0);
+                $sellerDashboardStats['paid_orders'] = (int)($row['paid_orders'] ?? 0);
+                $sellerDashboardStats['paid_to_process'] = (int)($row['paid_to_process'] ?? 0);
+                $sellerDashboardStats['awaiting_shipment'] = (int)($row['awaiting_shipment'] ?? 0);
+                $sellerDashboardStats['shipped'] = (int)($row['shipped'] ?? 0);
+                $sellerDashboardStats['completed'] = (int)($row['completed'] ?? 0);
+                $sellerDashboardStats['cancelled_refunded'] = (int)($row['cancelled_refunded'] ?? 0);
+                $sellerDashboardStats['currency'] = (string)($row['currency'] ?? 'USD');
+                $sellerDashboardStats['paid_waiting_pack'] = (int)($row['awaiting_shipment'] ?? 0);
+            }
+        }
+    } catch (Throwable $e) {
+        error_log('member index seller aggregate stats load failed: ' . $e->getMessage());
+    }
 
     try {
         if (bv_member_sd_table_exists($pdo, 'orders') && bv_member_sd_table_exists($pdo, 'order_items') && bv_member_sd_table_exists($pdo, 'listings')) {
@@ -1270,19 +1362,6 @@ if ($isSellerApproved && $userId > 0) {
             $stmt->execute([':seller_id' => $sellerId]);
             $sellerRecentOrders = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 
-            foreach ($sellerRecentOrders as $row) {
-                $oStatus = strtolower(trim((string)($row['order_status'] ?? '')));
-                $payStatus = strtolower(trim((string)($row['payment_status'] ?? '')));
-				if (in_array($oStatus, ['pending', 'pending_payment', 'reserved', 'paid-awaiting-verify'], true)) {
-                    $sellerDashboardStats['new_orders']++;
-                }
-                if (in_array($payStatus, ['paid', 'captured', 'completed', 'success'], true)) {
-                    $sellerDashboardStats['paid_orders']++;
-					                    if (in_array($oStatus, ['pending', 'processing', 'confirmed', 'packing', 'paid', 'new'], true)) {
-                        $sellerDashboardStats['paid_waiting_pack']++;
-                    }
-                }
-            }
         }
     } catch (Throwable $e) {
         error_log('member index seller recent orders load failed: ' . $e->getMessage());
@@ -1479,9 +1558,15 @@ if ($isSellerApproved && $userId > 0) {
             $sellerSalesMonthly = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 
             if ($sellerSalesMonthly) {
-                $first = $sellerSalesMonthly[0];
-                $sellerDashboardStats['this_month_sales'] = (float)($first['gross_sales'] ?? 0);
-                $sellerDashboardStats['currency'] = (string)($first['currency'] ?? 'USD');
+                 $currentMonthKey = (new DateTimeImmutable('now'))->format('Y-m');
+                foreach ($sellerSalesMonthly as $monthRow) {
+                    if ((string)($monthRow['sales_month'] ?? '') === $currentMonthKey) {
+                        $sellerDashboardStats['this_month_sales'] = (float)($monthRow['gross_sales'] ?? 0);
+                        $sellerDashboardStats['this_month_orders'] = (int)($monthRow['orders_count'] ?? $sellerDashboardStats['this_month_orders']);
+                        $sellerDashboardStats['currency'] = (string)($monthRow['currency'] ?? $sellerDashboardStats['currency']);
+                        break;
+                    }
+                }
             }
         }
     } catch (Throwable $e) {
@@ -1524,8 +1609,8 @@ if ($isSellerApproved && $userId > 0) {
             $sellerRefundMonthly = $stmt->fetchAll(PDO::FETCH_ASSOC) ?: [];
 
             if ($sellerSalesMonthly) {
-                $month = (string)($sellerSalesMonthly[0]['sales_month'] ?? '');
-                $gross = (float)($sellerSalesMonthly[0]['gross_sales'] ?? 0);
+                $month = (new DateTimeImmutable('now'))->format('Y-m');
+                $gross = (float)$sellerDashboardStats['this_month_sales'];
                 $refunded = 0.0;
                 foreach ($sellerRefundMonthly as $refundMonthRow) {
                     if ((string)($refundMonthRow['sales_month'] ?? '') === $month) {
@@ -2231,6 +2316,16 @@ bv_member_page_begin('My Account | Bettavaro', 'Bettavaro member and seller dash
 
               <div class="mini-card" id="seller-sales-summary">
               <h3>Sales Summary by Month</h3>
+              <div class="detail-grid" style="margin-bottom:12px;">
+                <div class="detail-box"><strong>Total Seller Orders</strong><div><?= (int)$sellerDashboardStats['total_seller_orders'] ?></div></div>
+                <div class="detail-box"><strong>This Month Orders</strong><div><?= (int)$sellerDashboardStats['this_month_orders'] ?></div></div>
+                <div class="detail-box"><strong>This Month Sales</strong><div><?= bv_member_e(bv_member_sd_money((float)$sellerDashboardStats['this_month_sales'], (string)$sellerDashboardStats['currency'])) ?></div></div>
+                <div class="detail-box"><strong>Paid / To Process</strong><div><?= (int)$sellerDashboardStats['paid_to_process'] ?></div></div>
+                <div class="detail-box"><strong>Awaiting Shipment</strong><div><?= (int)$sellerDashboardStats['awaiting_shipment'] ?></div></div>
+                <div class="detail-box"><strong>Shipped</strong><div><?= (int)$sellerDashboardStats['shipped'] ?></div></div>
+                <div class="detail-box"><strong>Completed</strong><div><?= (int)$sellerDashboardStats['completed'] ?></div></div>
+                <div class="detail-box"><strong>Cancelled / Refunded</strong><div><?= (int)$sellerDashboardStats['cancelled_refunded'] ?></div></div>
+              </div>			  
               <?php if (!$sellerSalesMonthly): ?>
                 <div class="empty">No sales summary data yet.</div>
               <?php else: ?>
